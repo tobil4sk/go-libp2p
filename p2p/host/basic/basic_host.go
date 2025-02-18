@@ -8,6 +8,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/connmgr"
@@ -96,11 +97,13 @@ type BasicHost struct {
 
 	addrChangeChan chan struct{}
 
-	addrMu                 sync.RWMutex
+	addrMu                 sync.RWMutex // protects the following fields
 	updateLocalIPv4Backoff backoff.ExpBackoff
 	updateLocalIPv6Backoff backoff.ExpBackoff
 	filteredInterfaceAddrs []ma.Multiaddr
 	allInterfaceAddrs      []ma.Multiaddr
+
+	relayAddrs atomic.Pointer[[]ma.Multiaddr]
 
 	disableSignedPeerRecord bool
 	signKey                 crypto.PrivKey
@@ -185,6 +188,7 @@ func NewHost(n network.Network, opts *HostOpts) (*BasicHost, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	hostCtx, cancel := context.WithCancel(context.Background())
 	h := &BasicHost{
 		network:                 n,
@@ -199,6 +203,8 @@ func NewHost(n network.Network, opts *HostOpts) (*BasicHost, error) {
 		disableSignedPeerRecord: opts.DisableSignedPeerRecord,
 	}
 
+	var relayAddrs []ma.Multiaddr
+	h.relayAddrs.Store(&relayAddrs)
 	h.updateLocalIpAddr()
 
 	if h.emitters.evtLocalProtocolsUpdated, err = h.eventbus.Emitter(&event.EvtLocalProtocolsUpdated{}, eventbus.Stateful); err != nil {
@@ -595,6 +601,13 @@ func (h *BasicHost) background() {
 		}
 	}
 
+	addrSub, err := h.EventBus().Subscribe(new(event.EvtAutoRelayAddrsUpdated), eventbus.Name("basic host address loop"))
+	if err != nil {
+		log.Errorf("failed to subscribe to the EvtAutoRelayAddrs: %s", err)
+		return
+	}
+	defer addrSub.Close()
+
 	// periodically schedules an IdentifyPush to update our peers for changes
 	// in our address set (if needed)
 	ticker := time.NewTicker(addrChangeTickrInterval)
@@ -612,6 +625,15 @@ func (h *BasicHost) background() {
 		select {
 		case <-ticker.C:
 		case <-h.addrChangeChan:
+		case e := <-addrSub.Out():
+			if evt, ok := e.(event.EvtAutoRelayAddrsUpdated); ok {
+				// Copy to a new slice. Copying to the slice pointed to by relayAddrs
+				// will introduce a race.
+				addrs := slices.Clone(evt.RelayAddrs)
+				h.relayAddrs.Store(&addrs)
+			} else {
+				log.Errorf("received unexpected event: %T %v", e, e)
+			}
 		case <-h.ctx.Done():
 			return
 		}
@@ -842,8 +864,17 @@ func (h *BasicHost) ConnManager() connmgr.ConnManager {
 // When used with AutoRelay, and if the host is not publicly reachable,
 // this will only have host's private, relay, and no public addresses.
 func (h *BasicHost) Addrs() []ma.Multiaddr {
+	addrs := h.AllAddrs()
 	// Make a copy. Consumers can modify the slice elements
-	addrs := slices.Clone(h.AddrsFactory(h.AllAddrs()))
+	if h.GetAutoNat() != nil && h.GetAutoNat().Status() == network.ReachabilityPrivate {
+		relayAddrsPtr := h.relayAddrs.Load()
+		// Only remove public addresses if we have relay addresses.
+		if relayAddrsPtr != nil && len(*relayAddrsPtr) > 0 {
+			addrs = slices.DeleteFunc(addrs, func(a ma.Multiaddr) bool { return manet.IsPublicAddr(a) })
+			addrs = append(addrs, *relayAddrsPtr...)
+		}
+	}
+	addrs = slices.Clone(h.AddrsFactory(addrs))
 	// Add certhashes for the addresses provided by the user via address factory.
 	return h.addCertHashes(ma.Unique(addrs))
 }
