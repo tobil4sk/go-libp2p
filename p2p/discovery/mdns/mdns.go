@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math/rand"
+	"net"
 	"strings"
 	"sync"
 
@@ -35,6 +36,10 @@ type Notifee interface {
 	HandlePeerFound(peer.AddrInfo)
 }
 
+type InterfacesProvider interface {
+	Interfaces() ([]net.Interface, error)
+}
+
 type mdnsService struct {
 	host        host.Host
 	serviceName string
@@ -48,6 +53,8 @@ type mdnsService struct {
 	server     *zeroconf.Server
 
 	notifee Notifee
+
+	interfaces InterfacesProvider
 }
 
 func NewMdnsService(host host.Host, serviceName string, notifee Notifee) *mdnsService {
@@ -62,6 +69,10 @@ func NewMdnsService(host host.Host, serviceName string, notifee Notifee) *mdnsSe
 	}
 	s.ctx, s.ctxCancel = context.WithCancel(context.Background())
 	return s
+}
+
+func (s *mdnsService) SetInterfacesProvider(interfaces InterfacesProvider) {
+	s.interfaces = interfaces
 }
 
 func (s *mdnsService) Start() error {
@@ -133,6 +144,15 @@ func (s *mdnsService) startServer() error {
 		return err
 	}
 
+	var interfaces []net.Interface
+
+	if s.interfaces != nil {
+		interfaces, err = s.interfaces.Interfaces()
+		if err != nil {
+			return err
+		}
+	}
+
 	server, err := zeroconf.RegisterProxy(
 		s.peerName,
 		s.serviceName,
@@ -141,7 +161,7 @@ func (s *mdnsService) startServer() error {
 		s.peerName,
 		ips,
 		txts,
-		nil,
+		interfaces,
 	)
 	if err != nil {
 		return err
